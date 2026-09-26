@@ -16,6 +16,7 @@
 #include <linux/sizes.h>
 
 #include "../common/bt_address.h"
+#include "../common/resume.h"
 
 #define SECTOR_SIZE	512
 #define KERNEL_ADDR	0x62000000
@@ -272,7 +273,6 @@ static int do_pomera_boot(struct cmd_tbl *cmdtp, int flag, int argc,
 	int seq = 1, ret;
 	bool chainload_legacy = false;
 	unsigned long legacy_rc;
-	char command[96];
 	void *fdt;
 
 	if (argc != 1)
@@ -330,10 +330,8 @@ static int do_pomera_boot(struct cmd_tbl *cmdtp, int flag, int argc,
 	pomera_setup_bt_address(fdt, SZ_1M);
 	unmap_sysmem(fdt);
 
-	/* '-' tells bootz that no external initramfs is present. */
-	snprintf(command, sizeof(command), "bootz %x - %x",
-		 KERNEL_ADDR, FDT_ADDR);
-	return run_command(command, 0) ? CMD_RET_FAILURE : CMD_RET_SUCCESS;
+	return pomera_bootz(desc, KERNEL_ADDR, FDT_ADDR) ?
+		CMD_RET_FAILURE : CMD_RET_SUCCESS;
 
 fail:
 	printf("DM200: image load failed (%d)\n", ret);
