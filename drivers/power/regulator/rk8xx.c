@@ -297,6 +297,8 @@ static const struct rk8xx_reg_info rk818_ldo[] = {
 	{  800000, 100000, REG_LDO6_ON_VSEL, REG_LDO6_SLP_VSEL, NA, RK818_LDO_VSEL_MASK, },
 	{  800000, 100000, REG_LDO7_ON_VSEL, REG_LDO7_SLP_VSEL, NA, RK818_LDO_VSEL_MASK, },
 	{ 1800000, 100000, REG_LDO8_ON_VSEL, REG_LDO8_SLP_VSEL, NA, RK818_LDO_VSEL_MASK, },
+	{ 1800000, 100000, REG_BOOST_LDO9_ON_VSEL, REG_BOOST_LDO9_SLP_VSEL,
+	  NA, RK818_LDO_VSEL_MASK, },
 };
 #endif
 
@@ -695,8 +697,13 @@ static int _ldo_get_enable(struct udevice *pmic, int ldo)
 		break;
 	case RK808_ID:
 	case RK818_ID:
-		mask = 1 << ldo;
-		ret = pmic_reg_read(pmic, REG_LDO_EN);
+		if (priv->variant == RK818_ID && ldo == 8) {
+			mask = BIT(5);
+			ret = pmic_reg_read(pmic, REG_DCDC_EN);
+		} else {
+			mask = 1 << ldo;
+			ret = pmic_reg_read(pmic, REG_LDO_EN);
+		}
 		if (ret < 0)
 			return ret;
 		break;
@@ -804,8 +811,14 @@ static int _ldo_set_enable(struct udevice *pmic, int ldo, bool enable)
 		break;
 	case RK808_ID:
 	case RK818_ID:
-		mask = 1 << ldo;
-		ret = pmic_clrsetbits(pmic, REG_LDO_EN, mask,
+		if (priv->variant == RK818_ID && ldo == 8) {
+			mask = BIT(5);
+			en_reg = REG_DCDC_EN;
+		} else {
+			mask = 1 << ldo;
+			en_reg = REG_LDO_EN;
+		}
+		ret = pmic_clrsetbits(pmic, en_reg, mask,
 				       enable ? mask : 0);
 		break;
 	case RK809_ID:
@@ -894,7 +907,7 @@ static int _pldo_set_enable(struct udevice *pmic, int pldo, bool enable)
 static int _ldo_set_suspend_enable(struct udevice *pmic, int ldo, bool enable)
 {
 	struct rk8xx_priv *priv = dev_get_priv(pmic);
-	uint mask;
+	uint mask, en_reg;
 	int ret = 0;
 
 	switch (priv->variant) {
@@ -906,8 +919,14 @@ static int _ldo_set_suspend_enable(struct udevice *pmic, int ldo, bool enable)
 		break;
 	case RK808_ID:
 	case RK818_ID:
-		mask = 1 << ldo;
-		ret = pmic_clrsetbits(pmic, REG_SLEEP_SET_OFF2, mask,
+		if (priv->variant == RK818_ID && ldo == 8) {
+			mask = BIT(5);
+			en_reg = REG_SLEEP_SET_OFF1;
+		} else {
+			mask = 1 << ldo;
+			en_reg = REG_SLEEP_SET_OFF2;
+		}
+		ret = pmic_clrsetbits(pmic, en_reg, mask,
 				      enable ? 0 : mask);
 		break;
 	case RK809_ID:
@@ -981,8 +1000,13 @@ static int _ldo_get_suspend_enable(struct udevice *pmic, int ldo)
 		break;
 	case RK808_ID:
 	case RK818_ID:
-		mask = 1 << ldo;
-		val = pmic_reg_read(pmic, REG_SLEEP_SET_OFF2);
+		if (priv->variant == RK818_ID && ldo == 8) {
+			mask = BIT(5);
+			val = pmic_reg_read(pmic, REG_SLEEP_SET_OFF1);
+		} else {
+			mask = 1 << ldo;
+			val = pmic_reg_read(pmic, REG_SLEEP_SET_OFF2);
+		}
 		if (val < 0)
 			return val;
 		ret = (val & mask) ? 0 : 1;
@@ -1561,6 +1585,11 @@ static int rk8xx_buck_probe(struct udevice *dev)
 static int rk8xx_ldo_probe(struct udevice *dev)
 {
 	struct dm_regulator_uclass_plat *uc_pdata;
+	struct rk8xx_priv *priv = dev_get_priv(dev->parent);
+
+	if (priv->variant == RK818_ID &&
+	    (dev->driver_data < 1 || dev->driver_data > ARRAY_SIZE(rk818_ldo)))
+		return -EINVAL;
 
 	uc_pdata = dev_get_uclass_plat(dev);
 
