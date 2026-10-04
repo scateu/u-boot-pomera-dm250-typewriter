@@ -20,6 +20,7 @@
 #include <linux/sizes.h>
 
 #include "../common/bt_address.h"
+#include "../common/legacy_uboot.h"
 #include "../common/resume.h"
 
 #define SECTOR_SIZE		512
@@ -105,6 +106,10 @@ static int load_legacy_uboot(struct blk_desc *desc)
 		ret = -EBADMSG;
 		goto out;
 	}
+
+	ret = pomera_legacy_uboot_fixup(buf, size, crc);
+	if (ret)
+		goto out;
 
 	flush_cache(load_addr, blocks * SECTOR_SIZE);
 	invalidate_icache_all();

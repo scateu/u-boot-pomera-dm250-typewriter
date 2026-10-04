@@ -3,3 +3,4 @@
 obj-y += pomera_dm250.o boot.o
 obj-y += ../common/bt_address.o
 obj-y += ../common/resume.o
+obj-y += ../common/legacy_uboot.o
