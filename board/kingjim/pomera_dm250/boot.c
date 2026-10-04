@@ -2,15 +2,19 @@
 /* DM250 direct boot and legacy eMMC U-Boot chainloader. */
 #include <blk.h>
 #include <backlight.h>
+#include <bootm.h>
 #include <command.h>
 #include <cpu_func.h>
 #include <dm.h>
 #include <generic-phy.h>
+#include <hang.h>
 #include <mapmem.h>
 #include <mmc.h>
 #include <memalign.h>
 #include <asm/io.h>
+#include <asm/u-boot-arm.h>
 #include <asm/unaligned.h>
+#include <dm/root.h>
 #include <linux/delay.h>
 #include <linux/libfdt.h>
 #include <linux/sizes.h>
@@ -284,7 +288,6 @@ static int do_pomera_boot(struct cmd_tbl *cmdtp, int flag, int argc,
 	u32 kernel_size;
 	int seq = 1, ret;
 	bool chainload_legacy = false;
-	unsigned long legacy_rc;
 	void *fdt;
 
 	if (argc != 1)
@@ -315,18 +318,26 @@ static int do_pomera_boot(struct cmd_tbl *cmdtp, int flag, int argc,
 		goto fail;
 	}
 	if (chainload_legacy) {
-		dm250_display_shutdown();
 		puts("DM250: loading legacy eMMC U-Boot\n");
 		ret = load_legacy_uboot(desc);
 		if (ret)
 			goto fail;
 
+		puts("DM250: starting legacy eMMC U-Boot\n");
+		dm250_display_shutdown();
+		board_quiesce_devices();
+		dm_remove_devices_active();
+		/*
+		 * The vendor reset code invalidates TLBs before disabling the
+		 * MMU and does not clean our dirty D-cache lines. Leave the CPU
+		 * in the cache/MMU-off state expected from the vendor loader.
+		 */
+		cleanup_before_linux();
+
 		/* The legacy image is ARM code; do not use the go command here. */
-		legacy_rc = ((unsigned long (*)(int, char *const []))
-				(ulong)LEGACY_UBOOT_ADDR)(0, NULL);
-		printf("DM250: legacy eMMC U-Boot returned (0x%lx)\n",
-		       legacy_rc);
-		return CMD_RET_FAILURE;
+		((void (*)(int, char *const []))(ulong)LEGACY_UBOOT_ADDR)(0, NULL);
+		/* Devices and CPU state cannot be restored if the image returns. */
+		hang();
 	}
 	ret = load_krnl(desc, layout->kernel, layout->kernel_sectors,
 			KERNEL_ADDR, &kernel_size);
