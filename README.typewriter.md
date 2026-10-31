@@ -6,6 +6,8 @@ DEMO: <https://www.youtube.com/watch?v=r5F_BPKYIpU>
 
 based on:
  - ichinomoto's DM250 SD card Debian image: <https://www.ekesete.net/log/?p=9565>
+ - icninomoto's Pomera U-Boot <https://github.com/ichinomoto/u-boot>
+ - jcs's Pomera U-Boot <https://github.com/jcs/u-boot>
  - rockchip's boot from SD <https://github.com/mfkiwl/rk-open-docs/blob/master/MMC/Rockchip_Developer_Guide_SD_Boot_CN.md>
  - a successful one on Chromebook Samsung Plus RK3399: <https://github.com/scateu/u-boot-typewriter>
 
