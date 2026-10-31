@@ -40,10 +40,15 @@ vi cmd/Makefile cmd/Kconfig
 ## 3b drop all powersave function
 
 # 4. build and write
+
+## 4a. Drop the 1MB limit from /build/tools/rockchip/loaderimage.c and write_uboot.sh
+
 ./make_uboot_image.sh dm250
 sudo ./write_uboot.sh dm250 /dev/mmcblk0
+
 ```
 
 ## TODO
- - LIMIT: 1MB at most - FIXME.
+ x LIMIT: 1MB at most - FIXME. override.
  - powersave, brightness
+ - power button

@@ -5,8 +5,8 @@
 
 #define MODE_PACK             0
 #define MODE_UNPACK           1
-#define UBOOT_NUM             4
-#define UBOOT_MAX_SIZE        (1024*1024)
+#define UBOOT_NUM             1
+#define UBOOT_MAX_SIZE        (4*1024*1024)
 #ifndef CONFIG_TEXT_BASE
 #define CONFIG_TEXT_BASE       0x60000000
 #endif
