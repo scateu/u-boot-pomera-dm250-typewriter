@@ -1,0 +1,411 @@
+// SPDX-License-Identifier: GPL-2.0+
+/*
+ * cmd_tw_fs.c - filesystem load/save for the typewriter command.
+ *
+ * Adapted from the vim-for-Uboot `ved` reference, updated to the U-Boot 2026.07
+ * header set (no <common.h>) and to the codepoint line model: files are UTF-8
+ * on disk, decoded into u32 codepoint lines on load and re-encoded on save.
+ *
+ * The I/O scratch buffer is malloc()'d from U-Boot's heap, NOT staged at a
+ * fixed CONFIG_SYS_LOAD_ADDR like the ved reference. On this board (RK3399)
+ * CONFIG_SYS_LOAD_ADDR is 0x800800, but U-Boot proper runs from DRAM at
+ * 0x00800000 with its heap right above - so a multi-MB buffer there overwrote
+ * U-Boot's own image and the FAT driver's directory/table buffers, which were
+ * then flushed to the card and CORRUPTED THE PARTITION. malloc() hands out a
+ * region distinct from both, so there is no overlap. fs_set_blk_dev() is called
+ * before every op because U-Boot's FS layer doesn't retain the active device.
+ */
+#include <command.h>
+#include <fs.h>
+#include <mapmem.h>
+#include <malloc.h>
+#include <linux/string.h>
+#include <linux/errno.h>
+#include "cmd_tw.h"
+
+int tw_fs_str_to_type(const char *s)
+{
+	if (!strcmp(s, "fat") || !strcmp(s, "vfat"))
+		return FS_TYPE_FAT;
+	if (!strcmp(s, "ext4"))
+		return FS_TYPE_EXT;
+	if (!strcmp(s, "squashfs"))
+		return FS_TYPE_SQUASHFS;
+	return FS_TYPE_ANY;
+}
+
+int tw_fs_probe(struct tw_fs *fs, const char *iftype,
+		const char *dev_part, const char *fstype)
+{
+	int fs_type;
+
+	if (!iftype || !dev_part)
+		return -1;
+
+	strncpy(fs->iftype, iftype, sizeof(fs->iftype) - 1);
+	strncpy(fs->dev_part, dev_part, sizeof(fs->dev_part) - 1);
+	fs->iftype[sizeof(fs->iftype) - 1] = '\0';
+	fs->dev_part[sizeof(fs->dev_part) - 1] = '\0';
+
+	if (fstype) {
+		strncpy(fs->fstype, fstype, sizeof(fs->fstype) - 1);
+		fs->fstype[sizeof(fs->fstype) - 1] = '\0';
+		fs_type = tw_fs_str_to_type(fstype);
+	} else {
+		fs->fstype[0] = '\0';
+		fs_type = FS_TYPE_ANY;
+	}
+
+	if (fs_set_blk_dev(fs->iftype, fs->dev_part, fs_type) != 0) {
+		fs->valid = 0;
+		return -1;
+	}
+
+	fs->valid = 1;
+	return 0;
+}
+
+static int tw_fs_set(struct tw_fs *fs)
+{
+	int fs_type;
+
+	if (!fs->valid)
+		return -1;
+
+	fs_type = fs->fstype[0] ? tw_fs_str_to_type(fs->fstype) : FS_TYPE_ANY;
+
+	return fs_set_blk_dev(fs->iftype, fs->dev_part, fs_type);
+}
+
+/*
+ * List regular files in the root of the current device into s->pick_name[],
+ * for the ^R picker. Returns the count (0 on error/empty). Directories and dot
+ * entries are skipped. Names longer than the buffer are truncated.
+ */
+int tw_list_files(struct tw_state *s)
+{
+	struct fs_dir_stream *dirs;
+	struct fs_dirent *dent;
+
+	s->pick_count = 0;
+	s->pick_sel = 0;
+	s->pick_top = 0;
+
+	if (tw_fs_set(&s->fs) != 0)
+		return 0;
+
+	dirs = fs_opendir("/");
+	if (!dirs)
+		return 0;
+
+	while (s->pick_count < TW_PICK_MAX) {
+		dent = fs_readdir(dirs);
+		if (!dent)
+			break;
+		if (dent->type != FS_DT_REG)
+			continue;                       /* files only */
+		if (dent->name[0] == '.')
+			continue;                       /* skip dotfiles */
+		strncpy(s->pick_name[s->pick_count], dent->name,
+			TW_PICK_NAMELEN - 1);
+		s->pick_name[s->pick_count][TW_PICK_NAMELEN - 1] = '\0';
+		s->pick_count++;
+	}
+
+	fs_closedir(dirs);
+	return s->pick_count;
+}
+
+/*
+ * Delete a file in the root of the current device (Del in the ^R picker).
+ * Returns 0 ok, nonzero on failure (fs doesn't support unlink - only FAT/exFAT
+ * do in this U-Boot - or the file is missing). Re-asserts the device first
+ * (fs ops clear the active blk dev, same as every other op here).
+ */
+int tw_fs_unlink_name(struct tw_state *s, const char *name)
+{
+	char path[TW_PICK_NAMELEN + 1];
+
+	if (!name || !name[0])
+		return -1;
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+
+	path[0] = '/';
+	strncpy(path + 1, name, sizeof(path) - 2);
+	path[sizeof(path) - 1] = '\0';
+
+	return fs_unlink(path);
+}
+
+/*
+ * Copy oldn -> newn in the root of the current device (raw byte copy, used to
+ * implement Rename as copy+delete since this U-Boot has no fs_rename). Reads the
+ * whole old file into a malloc'd buffer, writes it out under the new name. Does
+ * NOT touch the editor buffer, so it's safe regardless of what's being edited.
+ * Uses bare names (no leading '/'), matching tw_file_load/save. Re-asserts the
+ * device before each fs op (each clears the active blk dev). Same tight-buffer
+ * heap hygiene as load/save (a big outstanding alloc across the FAT writer can
+ * corrupt the on-disk directory). Returns 0 ok, nonzero on failure.
+ */
+int tw_fs_copy_name(struct tw_state *s, const char *oldn, const char *newn)
+{
+	loff_t fsize = 0, got = 0, wrote = 0;
+	char  *buf;
+	ulong  addr;
+	int    ret;
+
+	if (!oldn || !oldn[0] || !newn || !newn[0])
+		return -1;
+
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+	ret = fs_size(oldn, &fsize);
+	if (ret < 0)
+		return -1;
+	/* Rename must be lossless. If the source is bigger than our scratch cap,
+	 * refuse rather than copy a truncated file. (-2 = too big to copy.) */
+	if (fsize > TW_FILE_BUF_SIZE)
+		return -2;
+
+	/* Zero-length file: write an empty file under the new name. */
+	buf = malloc((size_t)fsize + 1);
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);
+
+	if (fsize > 0) {
+		if (tw_fs_set(&s->fs) != 0) { free(buf); return -1; }
+		ret = fs_read(oldn, addr, 0, fsize, &got);
+		if (ret < 0 || got != fsize) { free(buf); return -1; }
+	}
+
+	if (tw_fs_set(&s->fs) != 0) { free(buf); return -1; }
+	ret = fs_write(newn, addr, 0, fsize, &wrote);
+	free(buf);
+	if (ret < 0 || wrote != fsize)
+		return -1;
+	return 0;
+}
+
+
+/* Decode one UTF-8 codepoint from s (len bytes available). Returns bytes
+ * consumed and sets *cp. Malformed input consumes 1 byte and yields U+FFFD. */
+static int utf8_decode(const char *s, int len, u32 *cp)
+{
+	unsigned char c = (unsigned char)s[0];
+
+	if (c < 0x80) {
+		*cp = c;
+		return 1;
+	}
+	if ((c & 0xE0) == 0xC0 && len >= 2) {
+		*cp = ((u32)(c & 0x1F) << 6) | ((unsigned char)s[1] & 0x3F);
+		return 2;
+	}
+	if ((c & 0xF0) == 0xE0 && len >= 3) {
+		*cp = ((u32)(c & 0x0F) << 12) |
+		      (((unsigned char)s[1] & 0x3F) << 6) |
+		      ((unsigned char)s[2] & 0x3F);
+		return 3;
+	}
+	if ((c & 0xF8) == 0xF0 && len >= 4) {
+		*cp = ((u32)(c & 0x07) << 18) |
+		      (((unsigned char)s[1] & 0x3F) << 12) |
+		      (((unsigned char)s[2] & 0x3F) << 6) |
+		      ((unsigned char)s[3] & 0x3F);
+		return 4;
+	}
+	*cp = 0xFFFD;
+	return 1;
+}
+
+/* Encode codepoint cp into buf (>= 4 bytes). Returns bytes written. */
+static int utf8_encode(u32 cp, char *buf)
+{
+	if (cp < 0x80) {
+		buf[0] = (char)cp;
+		return 1;
+	}
+	if (cp < 0x800) {
+		buf[0] = (char)(0xC0 | (cp >> 6));
+		buf[1] = (char)(0x80 | (cp & 0x3F));
+		return 2;
+	}
+	if (cp < 0x10000) {
+		buf[0] = (char)(0xE0 | (cp >> 12));
+		buf[1] = (char)(0x80 | ((cp >> 6) & 0x3F));
+		buf[2] = (char)(0x80 | (cp & 0x3F));
+		return 3;
+	}
+	buf[0] = (char)(0xF0 | (cp >> 18));
+	buf[1] = (char)(0x80 | ((cp >> 12) & 0x3F));
+	buf[2] = (char)(0x80 | ((cp >> 6) & 0x3F));
+	buf[3] = (char)(0x80 | (cp & 0x3F));
+	return 4;
+}
+
+static void tw_empty_buffer(struct tw_state *s)
+{
+	s->num_lines = 1;
+	s->line_len[0] = 0;
+}
+
+/* Append codepoint cp to the current last line, splitting lines on '\n'.
+ * Sets s->load_truncated if the buffer geometry (TW_MAX_LINES / TW_MAX_COLS)
+ * forces data to be dropped, so the caller can warn and suppress auto-save. */
+static void tw_load_cp(struct tw_state *s, u32 cp)
+{
+	int row = s->num_lines - 1;
+
+	if (cp == '\n') {
+		if (s->num_lines < TW_MAX_LINES) {
+			s->line_len[s->num_lines] = 0;
+			s->num_lines++;
+		} else {
+			s->load_truncated = 1;   /* out of lines: dropping this + rest */
+		}
+		return;
+	}
+	if (cp == '\r')
+		return;                 /* drop CR of CRLF */
+	if (s->line_len[row] < TW_MAX_COLS - 1)
+		s->lines[row][s->line_len[row]++] = cp;
+	else
+		s->load_truncated = 1;  /* line full: rest of this line dropped */
+}
+
+int tw_file_load(struct tw_state *s, const char *path)
+{
+	loff_t len_read = 0, fsize = 0;
+	size_t cap;
+	char  *buf;
+	ulong  addr;
+	int    ret, off;
+
+	/* Query the size first and allocate exactly that (+1 guard), rather than
+	 * a fixed multi-MB buffer held across fs_read() - same heap-hygiene
+	 * reason as tw_file_save(): keep the pool clean for the FS layer's own
+	 * allocations. A missing file -> empty buffer. */
+	s->load_truncated = 0;               /* cleared per load; set below if we drop data */
+	if (tw_fs_set(&s->fs) != 0)
+		return -1;
+	ret = fs_size(path, &fsize);
+	if (ret < 0 || fsize <= 0) {
+		tw_empty_buffer(s);              /* new/empty file */
+		return 0;
+	}
+	if (fsize > TW_FILE_BUF_SIZE) {      /* clamp pathologically large files */
+		fsize = TW_FILE_BUF_SIZE;
+		s->load_truncated = 1;           /* only read the first ~4 MB */
+	}
+
+	cap = (size_t)fsize + 1;
+	buf = malloc(cap);
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);       /* physical addr for fs_read() */
+
+	/* fs_size() cleared the active device; re-assert before fs_read(). */
+	if (tw_fs_set(&s->fs) != 0) {
+		free(buf);
+		return -1;
+	}
+
+	ret = fs_read(path, addr, 0, (loff_t)fsize, &len_read);
+	if (ret < 0) {
+		free(buf);
+		if (ret == -ENOENT || len_read == 0) {
+			tw_empty_buffer(s);     /* new file: empty buffer */
+			return 0;
+		}
+		return ret;
+	}
+
+	tw_empty_buffer(s);
+	s->line_len[0] = 0;
+	s->num_lines = 1;
+
+	off = 0;
+	while (off < (int)len_read) {
+		u32 cp;
+
+		off += utf8_decode(buf + off, (int)len_read - off, &cp);
+		tw_load_cp(s, cp);
+	}
+
+	free(buf);
+	return 0;
+}
+
+/* Compute the exact UTF-8 byte length of the whole buffer (content + one
+ * newline per line), so we can allocate precisely that much. */
+static size_t tw_serialized_len(struct tw_state *s)
+{
+	size_t n = 0;
+	int i, j;
+	char tmp[4];
+
+	for (i = 0; i < s->num_lines; i++) {
+		for (j = 0; j < s->line_len[i]; j++)
+			n += utf8_encode(s->lines[i][j], tmp);
+		n += 1;                          /* newline */
+	}
+	return n;
+}
+
+int tw_file_save(struct tw_state *s)
+{
+	size_t need = tw_serialized_len(s);
+	size_t cap  = need + 8;              /* small slack; bounds-checked below */
+	char  *buf, *p;
+	ulong  addr;
+	loff_t written = 0;
+	int    ret, i, j;
+
+	/*
+	 * Allocate EXACTLY what this file needs, not a fixed multi-MB buffer.
+	 * The previous fixed 3-4 MB allocation was held across fs_write() while
+	 * U-Boot's FAT writer did its own malloc()/strdup()/malloc_cache_aligned
+	 * for the directory iterator and LFN scratch; a large outstanding
+	 * allocation can fragment/stress the pool so those land on bad memory,
+	 * corrupting the on-disk directory. A tight buffer keeps the heap clean.
+	 */
+	buf = malloc(cap);
+	if (!buf)
+		return -1;
+	addr = map_to_sysmem(buf);           /* physical addr for fs_write() */
+
+	p = buf;
+	for (i = 0; i < s->num_lines; i++) {
+		for (j = 0; j < s->line_len[i]; j++) {
+			if ((size_t)(p - buf) + 4 > cap)   /* hard overflow guard */
+				goto overflow;
+			p += utf8_encode(s->lines[i][j], p);
+		}
+		if ((size_t)(p - buf) + 1 > cap)
+			goto overflow;
+		*p++ = '\n';
+	}
+
+	if (tw_fs_set(&s->fs) != 0) {
+		free(buf);
+		return -1;
+	}
+
+	{
+		loff_t total = (loff_t)(p - buf);
+
+		ret = fs_write(s->filename, addr, 0, total, &written);
+		free(buf);
+		if (ret < 0 || written != total)
+			return -1;
+		s->last_write_bytes = (int)total;  /* on-screen diagnostic */
+	}
+	s->dirty = 0;
+	return 0;
+
+overflow:
+	free(buf);
+	return -1;
+}
