@@ -4,6 +4,8 @@ WIP
 
 DEMO: <https://www.youtube.com/watch?v=r5F_BPKYIpU>
 
+<img width="5712" height="4284" alt="IMG_3247" src="https://github.com/user-attachments/assets/d23f91c6-44ba-4057-a4c7-375a81b196ac" />
+
 based on:
  - ichinomoto's DM250 SD card Debian image: <https://www.ekesete.net/log/?p=9565>
  - icninomoto's Pomera U-Boot <https://github.com/ichinomoto/u-boot>
