@@ -37,6 +37,7 @@
 #include "cmd_tw.h"
 #include "wubi_embed.h"
 #include <asm/gpio.h>
+#include <power/pmic.h> /* 🔧 補上這行，徹底消除 pmic_reg_read 未聲明的編譯錯誤 */
 
 /* --- from cmd_tw_fs.c --- */
 int tw_fs_probe(struct tw_fs *fs, const char *iftype, const char *dev_part,
@@ -608,11 +609,6 @@ static int tw_read_key(void)
 	 */
 	while (!tstc()) {
 		/* 🔧 每 10 毫秒就進來強行檢查一次物理引腳 */
-		gpio_request(2, "pwr_hard");
-		gpio_direction_input(2);
-		gpio_request(20, "lid_hard");
-		gpio_direction_input(20);
-
 		/* 只要抓到低電平（0），立刻在內部分發關機，絕不拖泥帶水 */
 		if (gpio_get_value(2) == 0 || gpio_get_value(20) == 0) {
 			unsigned long now_time = get_timer(0);
@@ -2029,22 +2025,24 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
-	case KEY_CTRL_T: {         /* battery status: %, AC, live current (bottom bar) */
-		int pct = -1, chg = 0, ac = -1, ma = 0;
-		int have_cs = (tw_read_charge_state(&pct, &chg, &ac) == 0);
-		int have_ma = (tw_read_batt_current(&ma) == 0);
+	case KEY_CTRL_T: { /* Pomera DM250 原生電量讀取 */
+		struct udevice *pmic_dev = NULL;
+		int pct = -1;
 
-		/* Raw signed current + AC flag (negative mA = discharging). The EC
-		 * charge-state % and AC are reliable; the current comes from the SBS
-		 * battery register (charge-state's own current field is garbage). */
-		if (!have_cs && !have_ma) {
-			tw_status(s, "[ Battery: no EC ]");
-		} else if (have_ma) {
-			tw_status(s, "[ BAT: %d%%  AC:%d  CUR: %d mA ]",
-				  have_cs ? pct : -1, have_cs ? ac : -1, ma);
+		/* 1. 尋找掛載在 I2C 總線上的 rk818 PMIC 裝置 */
+		if (uclass_get_device_by_name(UCLASS_PMIC, "pmic@1c", &pmic_dev) == 0 && pmic_dev) {
+			/* 2. 調用標準 PMIC 接口讀取 0xe0 寄存器（SOC_REG） */
+			int val = pmic_reg_read(pmic_dev, 0xe0);
+			if (val >= 0 && val <= 100) {
+				pct = val;
+			}
+		}
+
+		/* 3. 精準打印到打字機的底部狀態欄 */
+		if (pct >= 0) {
+			tw_status(s, "[ BAT: %d%% ]", pct);
 		} else {
-			tw_status(s, "[ BAT: %d%%  AC:%d  (current read failed) ]",
-				  pct, ac);
+			tw_status(s, "[ BAT: Fetch failed ]");
 		}
 		break;
 	}
@@ -2284,6 +2282,26 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 	/* Show the exception level in the startup line: the event-stream WFE idle
 	 * (low power) only engages at EL>=2. EL2 = good; EL1 would mean the idle
 	 * loop is busy-spinning and power-saving isn't active. See POWERSAVE.md. */
+
+
+	/* === 🔧 Pomera DM250 硬件引腳一次性初始化與常駐運行點燈 === */
+	{
+		/* 1. 配置 2 號與 20 號引腳為輸入（電源鍵與合蓋開關） */
+		if (gpio_request(2, "pwr_btn") == 0) {
+			gpio_direction_input(2);
+		}
+		if (gpio_request(20, "lid_switch") == 0) {
+			gpio_direction_input(20);
+		}
+
+		// POMERA DM250 Type-C Port LED Light: Green
+		/* 2. 一次性鎖定並強行點亮 B12 綠色指示燈 */
+		// 根據你在 Shell 中的實測：gpio set b12 是點亮（輸出高電平 1）
+		if (gpio_request(44, "status_led") == 0) {
+			gpio_direction_output(44, 1); /* 開機入口處直接拉高 ➡️ 綠燈常亮 */
+		}
+	}
+
 	if (s->load_truncated)
 		tw_status(s, "[ %s TRUNCATED to %d lines - too big; READ-ONLY ]",
 			  s->filename, s->num_lines);
