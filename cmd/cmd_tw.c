@@ -36,6 +36,7 @@
 #endif
 #include "cmd_tw.h"
 #include "wubi_embed.h"
+#include <asm/gpio.h>
 
 /* --- from cmd_tw_fs.c --- */
 int tw_fs_probe(struct tw_fs *fs, const char *iftype, const char *dev_part,
@@ -598,65 +599,55 @@ static inline void tw_stay_awake(void)
 static int tw_read_key(void)
 {
 	int c;
+	static unsigned long last_press_time = 0;
 
-	/*
-	 * Wait for an event. Two states:
-	 *
-	 *  1. Active window - for TW_ACTIVE_WINDOW_MS (2 s) after the last keypress,
-	 *     poll cheaply every TW_ACTIVE_POLL_MS. This spans think-pauses between
-	 *     keys and, crucially, keeps the input layer polled while a key is HELD
-	 *     so its auto-repeat fires (a held key emits no fresh IRQ, so a WFI would
-	 *     never wake for the repeat). Each key re-arms the window.
-	 *
-	 *  2. Deep sleep - once the window lapses with nothing pending, drop into a
-	 *     WFI with NO timer armed: the CPU sleeps until the cros_ec IRQ (INTID
-	 *     46) fires. A key, the power button, and the lid all ride that one line,
-	 *     so any of them wakes it instantly. There is no periodic wake at all -
-	 *     an idle typewriter draws its true floor until you touch it.
-	 *
-	 * A key surfaces as a console byte (tstc/getchar). The power button and lid
-	 * do NOT - they latch EC host-event flags on a separate channel - so once we
-	 * wake with no key pending we do a single host-event read to catch them and
-	 * power off. That read is a slow EC SPI transaction, but it only runs on a
-	 * genuine no-key wake (never during typing: keys short-circuit via tstc, and
-	 * the active window polls without touching the EC), so it never lags keys.
+	/* === 1. 鍵盤事件與硬件關機高頻同步等待循環 === */
+	/* 
+	 * 我們讓主執行緒在這裏溫和地一邊等待常規按鍵，一邊以 10 毫秒的超高靈敏度監控電源鍵。
+	 * 這樣既不會擠爆 I2C 總線，又絕對不會向外彈出 0 鍵碼干擾五筆輸入法！
 	 */
 	while (!tstc()) {
-		unsigned long now = get_timer(0);
+		/* 🔧 每 10 毫秒就進來強行檢查一次物理引腳 */
+		gpio_request(2, "pwr_hard");
+		gpio_direction_input(2);
+		gpio_request(20, "lid_hard");
+		gpio_direction_input(20);
 
-		/* Active window: cheap poll, no deep sleep, no EC access. Polling
-		 * (not WFI) here keeps the input layer's auto-repeat serviced while a
-		 * key is held - a held key emits no new IRQ, so a WFI would never wake
-		 * for the repeat. */
-		if (now < tw_active_until) {
-			schedule();
-			udelay(TW_ACTIVE_POLL_MS * 1000);
-			continue;
+		/* 只要抓到低電平（0），立刻在內部分發關機，絕不拖泥帶水 */
+		if (gpio_get_value(2) == 0 || gpio_get_value(20) == 0) {
+			unsigned long now_time = get_timer(0);
+			if (now_time - last_press_time > 500) { 
+				last_press_time = now_time;
+
+				/* 安全文本同步落盤 */
+				tw_file_save(&g_tw);
+				
+				run_command("poweroff", 0);
+
+				while (1) {
+					#if defined(CONFIG_ARM64) && defined(__aarch64__)
+					asm volatile("wfi"); 
+					#endif
+				}
+			}
 		}
 
-		/* Window lapsed. Before sleeping, decode a possible power/lid press
-		 * (the only non-key events); they share the WFI's INTID 46 wake. */
-		if (tw_poweroff_event_pending())
-			return KEY_POWER_BTN;
-
-		schedule();               /* keep any housekeeping fed */
-		tw_idle_nap(0);           /* no timer: sleep until an EC IRQ */
+		/* 強行讓 CPU 休息 10 毫秒，釋放 I2C 鍵盤晶片壓力並防止機身發熱 */
+		udelay(10000); 
+		schedule(); /* 餵飽 U-Boot 系統看門狗 */
 	}
 
-	/* A key is pending: activity, so keep the CPU awake for another window -
-	 * covers fast typing and the trailing bytes of an escape/Meta sequence. */
+	/* === 2. 只有當真正的鍵盤有字元時，才退出來讀取並解析 === */
 	tw_stay_awake();
-
 	c = getchar();
 
 	if (c != KEY_ESC)
 		return c;
 
-	/* ESC alone, or the start of a CSI/SS3 sequence (arrows/nav) or a Meta
-	 * chord (M-x arrives as ESC then x). */
+	/* 接下來的原版 CSI / 箭頭鍵 / Meta 鍵轉義序列解析完全保持原樣不動 */
 	c = tw_getch_timeout();
 	if (c < 0)
-		return KEY_ESC;         /* bare ESC */
+		return KEY_ESC;
 
 	if (c == '[' || c == 'O') {
 		c = tw_getch_timeout();
@@ -686,10 +677,6 @@ static int tw_read_key(void)
 		}
 	}
 
-	/* Meta (Alt) chord: ESC followed by a letter. NOTE: Meta keys don't work
-	 * on the target hardware/terminal, so these are effectively dormant - kept
-	 * wired (word motion / find) in case a future terminal delivers them. The
-	 * M-0..9 file slots were removed; use the ^R picker to switch files. */
 	switch (c) {
 	case 'f': case 'F': return KEY_META_F;
 	case 'b': case 'B': return KEY_META_B;
@@ -698,6 +685,7 @@ static int tw_read_key(void)
 	default:            return KEY_ESC;
 	}
 }
+
 
 static void tw_status(struct tw_state *s, const char *fmt, ...)
 {
@@ -1527,7 +1515,8 @@ static void tw_boot(struct tw_state *s)
 	/* Clear the framebuffer first so the editor's screen isn't left behind
 	 * the OS's boot output/menu - a clean handoff. Then scan + boot. */
 	run_command("cls", 0);
-	run_command("bootflow scan -lb", 0);
+	//run_command("bootflow scan -lb", 0);
+	run_command("sd", 0); // pomera dm250, sd command is customized by @ichinomoto
 	/* Only here if nothing booted - repaint the editor over the cleared
 	 * screen so we don't leave a blank display. */
 	s->first_paint = 1;
@@ -1541,64 +1530,8 @@ static void tw_boot(struct tw_state *s)
  */
 static void tw_poweroff(struct tw_state *s)
 {
-	/* 0. Consume the latched power-button / lid-closed host events NOW, before
-	 * we try to power off. If the poweroff doesn't actually take (e.g. PSCI is
-	 * unavailable at EL3), a still-latched event would otherwise re-fire
-	 * KEY_POWER_BTN on the next key-wait tick and loop. Clearing here makes it
-	 * a single attempt; the user can press again. */
-	tw_poweroff_events_clear();
-
-	/* 1. flush the document to disk if there's anything to save. */
-	if (tw_save_before_exit(s) != 0)
-		return;
-
-	/* 2. U-Boot's FAT/block writes are synchronous (write-through), so once
-	 * tw_file_save() returned the data is on the card. Small settle delay as
-	 * belt-and-braces before we cut power. */
-	mdelay(200);
-
-	/*
-	 * 3. Power off via PSCI SYSTEM_OFF - an SMC call to ARM Trusted Firmware
-	 * (coreboot's bl31). This is exactly how Linux powers this board off,
-	 * and it is button-wakeable (unlike the EC "ship mode" battery cutoff,
-	 * which wakes only on AC).
-	 *
-	 * Two things were needed to make it work, both now in place:
-	 *  a) a /psci node with `method = "smc"` in the U-Boot device tree
-	 *     (added in rk3399-gru-u-boot.dtsi) - without it the PSCI driver
-	 *     couldn't learn the conduit and every SMC returned -8;
-	 *  b) the PSCI firmware driver must be PROBED - U-Boot binds it but
-	 *     doesn't auto-probe (CONFIG_SYSRESET_PSCI is off), so we probe it
-	 *     explicitly here, which runs psci_probe() and sets the conduit.
-	 *
-	 * With both done, SYSTEM_OFF powers the board off and never returns. If
-	 * for some reason it does return (PSCI unavailable), we fall through to
-	 * the hold-the-button message rather than hanging.
-	 */
-	tw_render(s);         /* show the status before we go dark */
-	{
-		struct udevice *psci = NULL;
-		int probe, el;
-
-		/* Probe the PSCI firmware driver: this reads the DT `method`
-		 * ("smc") and sets the conduit. It FAILS (returns -EINVAL) if we
-		 * run at EL3 - PSCI is a call UP to firmware, so from EL3 there's
-		 * nothing above to call. If poweroff does nothing, the EL shown
-		 * here is the first thing to check (need EL < 3, i.e. EL2/EL1). */
-		probe = uclass_get_device_by_name(UCLASS_FIRMWARE, "psci", &psci);
-		el = current_el();
-
-		if (probe || el == 3) {
-			tw_status(s, "[ Poweroff unavailable: EL%d probe=%d - "
-				     "need SYSRESET_PSCI + EL<3 ]", el, probe);
-			return;
-		}
-
-		disable_interrupts();
-		invoke_psci_fn(PSCI_0_2_FN_SYSTEM_OFF, 0, 0, 0);
-		enable_interrupts();
-	}
-	tw_status(s, "[ Power off failed - hold the power button ]");
+  // u-boot works well, just call command
+	run_command("poweroff", 0);
 }
 
 /*
