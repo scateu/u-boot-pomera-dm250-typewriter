@@ -2286,6 +2286,22 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 
 	/* === 🔧 Pomera DM250 硬件引腳一次性初始化與常駐運行點燈 === */
 	{
+		struct udevice *pmic_dev = NULL;
+		
+		/* 0. 尋找並獲取 I2C 總線上的 rk818 PMIC 裝置 */
+		if (uclass_get_device_by_name(UCLASS_PMIC, "pmic@1c", &pmic_dev) == 0 && pmic_dev) {
+			/*
+			 * 2. 核心大招：四位一體聯動解鎖 
+			 *    完美復刻 ichinomoto 內核運行時的 LDO 總電流與滿電壓圖譜
+			 */
+			pmic_reg_write(pmic_dev, 0x22, 0x08); /* 解鎖上游 DCDC 限制軌 */
+			pmic_reg_write(pmic_dev, 0x24, 0xff); /* 強開 LDO3 使能開關 */
+			pmic_reg_write(pmic_dev, 0x2b, 0x7f); /* 拉滿 LDO2 級聯總水閘電壓 */
+			pmic_reg_write(pmic_dev, 0x2c, 0x7f); /* 拉滿 LDO3 週邊 IO 滿電壓 3.4V */
+			pmic_reg_write(pmic_dev, 0x3b, 0x0f); /* 確保 LDO 完全離開 Sleep 模式進入 Normal 工作狀態 */
+			mdelay(15); // 給穩壓器電容充電預留 15 毫秒緩衝
+		}
+
 		/* 1. 配置 2 號與 20 號引腳為輸入（電源鍵與合蓋開關） */
 		if (gpio_request(2, "pwr_btn") == 0) {
 			gpio_direction_input(2);
