@@ -618,17 +618,7 @@ static int tw_read_key(void)
 			unsigned long now_time = get_timer(0);
 			if (now_time - last_press_time > 500) { 
 				last_press_time = now_time;
-
-				/* 安全文本同步落盤 */
-				tw_file_save(&g_tw);
-				
-				run_command("poweroff", 0);
-
-				while (1) {
-					#if defined(CONFIG_ARM64) && defined(__aarch64__)
-					asm volatile("wfi"); 
-					#endif
-				}
+				return KEY_POWER_BTN;
 			}
 		}
 
@@ -1530,7 +1520,14 @@ static void tw_boot(struct tw_state *s)
  */
 static void tw_poweroff(struct tw_state *s)
 {
-  // u-boot works well, just call command
+	/* 1. flush the document to disk if there's anything to save. */
+	if (tw_save_before_exit(s) != 0)
+		return;
+	/* 2. U-Boot's FAT/block writes are synchronous (write-through), so once
+	 * tw_file_save() returned the data is on the card. Small settle delay as
+	 * belt-and-braces before we cut power. */
+	mdelay(1500);
+	// u-boot works well, just call command
 	run_command("poweroff", 0);
 }
 
