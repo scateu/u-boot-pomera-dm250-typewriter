@@ -31,7 +31,7 @@
  * fewer glyph blits per frame. */
 #define TW_GLYPH_H       16
 #define TW_CELL_W        8
-#define TW_SCALE         2
+#define TW_SCALE         1
 #define TW_CELL_PX       (TW_CELL_W * TW_SCALE)   /* narrow cell width, px */
 #define TW_ROW_PX        (TW_GLYPH_H * TW_SCALE)  /* cell height, px */
 
