@@ -429,7 +429,7 @@ int tw_video_init(struct tw_state *s)
 	if (!g_backlight &&
 	    uclass_first_device_err(UCLASS_PANEL, &g_panel))
 		g_panel = NULL;
-	//tw_backlight_set(TW_BACKLIGHT_DEFAULT); //FIXME do not change backlight for now
+	tw_backlight_set(TW_BACKLIGHT_DEFAULT);
 	return 0;
 }
 
