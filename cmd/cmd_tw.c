@@ -2025,8 +2025,7 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
-
-	case KEY_CTRL_T: { /* Pomera DM250 电压(带内阻补偿)/库仑计双百分比预测与实时电流读取 */
+	case KEY_CTRL_T: { /* Pomera DM250 精准电量计、实时电流与硬件 CPU/DRAM 频率纯只读解析 */
 	    struct udevice *pmic_dev = NULL;
 	    int has_data = 0;
 
@@ -2039,7 +2038,7 @@ static void tw_handle_key(struct tw_state *s, int key)
 		int vcalib1_l = pmic_reg_read(pmic_dev, 0xD8);
 		int vcalib1_h = pmic_reg_read(pmic_dev, 0xD7);
 
-		/* 3. 读取 Linux 固件存留在 PMIC 中的 Full Charge Capacity (满电容量 mAh) */
+		/* 3. 读取 Linux 存留在 PMIC 中的 Full Charge Capacity (满电容量 mAh) */
 		unsigned int fcc = 0;
 		int fcc3 = pmic_reg_read(pmic_dev, 0xE6);
 		int fcc2 = pmic_reg_read(pmic_dev, 0xE7);
@@ -2082,24 +2081,18 @@ static void tw_handle_key(struct tw_state *s, int key)
 		    }
 		    int bat_ma = (cur_adc * 1506) / 1000;
 
-		    /* ==============================================================
-		     * 🔧 核心修改：在此处加入内阻补偿算法 (IR Compensation)
-		     * 根据之前的实测，在 -510mA 的大电流下，负载拉低了电压。
-		     * 引入 150 毫欧（0.15 欧姆）的综合内阻阻抗，还原电池真实的物理开路电压。
-		     * ============================================================== */
+		    /* ==== 动态内阻双向电压补偿 (IR Compensation) ==== */
 		    int ocv_mv = bat_mv;
 		    if (bat_ma < 0) {
-			// 放电状态下：还原被内阻白白拉低的电压 ( measurement_voltage + I * R )
 			ocv_mv = bat_mv + (abs(bat_ma) * 280) / 1000; 
 		    } else if (bat_ma > 0) {
-			// 充电状态下：扣除被充电抬高的虚高电压 ( measurement_voltage - I * R )
 			ocv_mv = bat_mv - (bat_ma * 280) / 1000;
 		    }
 
-		    /* ==== 算法 A: 改用补偿后的开路电压（ocv_mv）映射百分比 ==== */
+		    /* ==== 算法 A: 补偿后的电压百分比 ==== */
 		    int pct_vol = -1;
-		    int v_max = 4150; // 满电一般 4.15V-4.2V
-		    int v_min = 3500; // 关机阈值 3.5V
+		    int v_max = 4150;
+		    int v_min = 3500;
 		    if (ocv_mv >= v_max) pct_vol = 100;
 		    else if (ocv_mv <= v_min) pct_vol = 0;
 		    else pct_vol = (ocv_mv - v_min) * 100 / (v_max - v_min);
@@ -2107,29 +2100,57 @@ static void tw_handle_key(struct tw_state *s, int key)
 		    /* ==== 算法 B: 硬件库仑计电量百分比 ==== */
 		    unsigned int raw_fcc = (fcc3 << 24) | (fcc2 << 16) | (fcc1 << 8) | fcc0;
 		    if (raw_fcc > 1) {
-			fcc = raw_fcc - 1; // Linux 官方校准
+			fcc = raw_fcc - 1;
 		    }
 		    if (fcc < 500 || fcc > 6000) {
-			fcc = 2500; // 降级容错基准
+			fcc = 2500;
 		    }
 
 		    int raw_gas = (g3 << 24) | (g2 << 16) | (g1 << 8) | g0;
-		    int remain_mah = raw_gas / 2390; // 转换为毫安时
+		    int remain_mah = raw_gas / 2390;
 		    int pct_clm = -1;
 
 		    if (remain_mah <= 0) pct_clm = 0;
 		    else if (remain_mah >= fcc) pct_clm = 100;
 		    else pct_clm = (remain_mah * 100) / fcc;
 
-		    /* 6. 精准打印到打字机底部状态栏 */
-		    // 格式: [ V:电压百分比% (补偿后开路电压mV) | C:库仑计百分比% (剩余/满电mAh) | 实时电流mA ]
-		    tw_status(s, "[ V:%d%% (%dmV) | C:%d%% (%dmAh/%dmAh) | I:%dmA ]", 
-			      pct_vol, ocv_mv, pct_clm, remain_mah, fcc, bat_ma);
+		    /* ==== 物理指针读取 RK3128 CRU 寄存器并解析实时频率 ==== */
+		    unsigned int apll_con0 = *(volatile unsigned int *)(0x20000000);
+		    unsigned int apll_con1 = *(volatile unsigned int *)(0x20000004);
+		    unsigned int cpu_nf = apll_con0 & 0xFFF;
+		    unsigned int cpu_nr = apll_con1 & 0x3F;
+		    unsigned int cpu_no1 = (apll_con1 >> 8) & 0x7;
+		    unsigned int cpu_no2 = (apll_con1 >> 12) & 0x7;
+		    
+		    unsigned int cpu_div_no1 = (cpu_no1 == 4) ? 4 : (cpu_no1 == 0 ? 1 : cpu_no1);
+		    unsigned int cpu_div_no2 = (cpu_no2 == 1) ? 1 : cpu_no2;
+		    if (cpu_div_no1 == 0) cpu_div_no1 = 1;
+		    if (cpu_div_no2 == 0) cpu_div_no2 = 1;
+		    if (cpu_nr == 0) cpu_nr = 1;
+		    unsigned int cpu_mhz = (24 * cpu_nf) / (cpu_nr * cpu_div_no1 * cpu_div_no2);
+
+		    unsigned int dpll_con0 = *(volatile unsigned int *)(0x20000030);
+		    unsigned int dpll_con1 = *(volatile unsigned int *)(0x20000034);
+		    unsigned int ddr_nf = dpll_con0 & 0xFFF;
+		    unsigned int ddr_nr = dpll_con1 & 0x3F;
+		    unsigned int ddr_no1 = (dpll_con1 >> 8) & 0x7;
+		    unsigned int ddr_no2 = (dpll_con1 >> 12) & 0x7;
+		    
+		    unsigned int ddr_div_no1 = (ddr_no1 == 4) ? 4 : (ddr_no1 == 0 ? 1 : ddr_no1);
+		    unsigned int ddr_div_no2 = (ddr_no2 == 1) ? 1 : ddr_no2;
+		    if (ddr_div_no1 == 0) ddr_div_no1 = 1;
+		    if (ddr_div_no2 == 0) ddr_div_no2 = 1;
+		    if (ddr_nr == 0) ddr_nr = 1;
+		    unsigned int ddr_mhz = (24 * ddr_nf) / (ddr_nr * ddr_div_no1 * ddr_div_no2);
+
+		    /* ==== 🔧 纯粹的只读汇报，无任何引脚和状态机强行介入 ==== */
+		    tw_status(s, "[ V:%d%% (%dmV) | C:%d%% (%dmAh/%dmAh) | I:%dmA | CPU:%dMHz | DDR:%dMHz ]", 
+			      pct_vol, ocv_mv, pct_clm, remain_mah, fcc, bat_ma, cpu_mhz, ddr_mhz);
 		    
 		    has_data = 1;
 		    break;
+			}
 		}
-	    }
 
 	    /* 容错降级 */
 	    if (!has_data) {
@@ -2137,7 +2158,6 @@ static void tw_handle_key(struct tw_state *s, int key)
 	    }
 	    break;
 	}
-
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
 		break;
