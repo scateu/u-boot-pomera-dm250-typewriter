@@ -2391,6 +2391,18 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 			pmic_reg_write(pmic_dev, 0x2b, 0x7f); /* 拉滿 LDO2 級聯總水閘電壓 */
 			pmic_reg_write(pmic_dev, 0x2c, 0x7f); /* 拉滿 LDO3 週邊 IO 滿電壓 3.4V */
 			pmic_reg_write(pmic_dev, 0x3b, 0x0f); /* 確保 LDO 完全離開 Sleep 模式進入 Normal 工作狀態 */
+
+			/* 解锁上游总输入限流 (0xA1 寄存器): 
+			   高位开启充电使能 (0x80)，低四位设为 0x7 (对应 2.0A 最大输入电流限制) 
+ 			*/
+			pmic_reg_write(pmic_dev, 0xA1, 0x87); 
+
+			/* 解锁电池充电限流 (0xA3 寄存器): 
+			   高位使能硬件恒流充电 (0x80)，恒压档位 (0x30 = 4.2V)，
+		           低四位设为 0x3 (对应 1600mA 最大灌入电流) 
+			 */
+			pmic_reg_write(pmic_dev, 0xA3, 0xB3); 
+
 			mdelay(15); // 給穩壓器電容充電預留 15 毫秒緩衝
 		}
 
@@ -2408,6 +2420,7 @@ static int do_typewriter(struct cmd_tbl *cmdtp, int flag,
 		if (gpio_request(44, "status_led") == 0) {
 			gpio_direction_output(44, 1); /* 開機入口處直接拉高 ➡️ 綠燈常亮 */
 		}
+		// 红灯是GPIO B8, 即GPIO 40.
 	}
 
 	if (s->load_truncated)
