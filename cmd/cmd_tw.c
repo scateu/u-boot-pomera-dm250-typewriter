@@ -2025,27 +2025,119 @@ static void tw_handle_key(struct tw_state *s, int key)
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
-	case KEY_CTRL_T: { /* Pomera DM250 原生電量讀取 */
-		struct udevice *pmic_dev = NULL;
-		int pct = -1;
 
-		/* 1. 尋找掛載在 I2C 總線上的 rk818 PMIC 裝置 */
-		if (uclass_get_device_by_name(UCLASS_PMIC, "pmic@1c", &pmic_dev) == 0 && pmic_dev) {
-			/* 2. 調用標準 PMIC 接口讀取 0xe0 寄存器（SOC_REG） */
-			int val = pmic_reg_read(pmic_dev, 0xe0);
-			if (val >= 0 && val <= 100) {
-				pct = val;
-			}
-		}
+	case KEY_CTRL_T: { /* Pomera DM250 电压(带内阻补偿)/库仑计双百分比预测与实时电流读取 */
+	    struct udevice *pmic_dev = NULL;
+	    int has_data = 0;
 
-		/* 3. 精準打印到打字機的底部狀態欄 */
-		if (pct >= 0) {
-			tw_status(s, "[ BAT: %d%% ]", pct);
-		} else {
-			tw_status(s, "[ BAT: Fetch failed ]");
+	    /* 1. 寻找挂载在 I2C 总线上的 rk818 PMIC 装置 */
+	    if (uclass_get_device_by_name(UCLASS_PMIC, "pmic@1c", &pmic_dev) == 0 && pmic_dev) {
+		
+		/* 2. 读取工厂电压校准值 (用于高精度电压计算) */
+		int vcalib0_l = pmic_reg_read(pmic_dev, 0xD6);
+		int vcalib0_h = pmic_reg_read(pmic_dev, 0xD5);
+		int vcalib1_l = pmic_reg_read(pmic_dev, 0xD8);
+		int vcalib1_h = pmic_reg_read(pmic_dev, 0xD7);
+
+		/* 3. 读取 Linux 固件存留在 PMIC 中的 Full Charge Capacity (满电容量 mAh) */
+		unsigned int fcc = 0;
+		int fcc3 = pmic_reg_read(pmic_dev, 0xE6);
+		int fcc2 = pmic_reg_read(pmic_dev, 0xE7);
+		int fcc1 = pmic_reg_read(pmic_dev, 0xE8);
+		int fcc0 = pmic_reg_read(pmic_dev, 0xE9);
+
+		/* 4. 实时读取 32 位硬件库仑计计数器 (GASCNT3 ~ GASCNT0) */
+		int g3 = pmic_reg_read(pmic_dev, 0xB8);
+		int g2 = pmic_reg_read(pmic_dev, 0xB9);
+		int g1 = pmic_reg_read(pmic_dev, 0xBA);
+		int g0 = pmic_reg_read(pmic_dev, 0xBB);
+
+		/* 5. 实时读取电压与电流 ADC 原始值 */
+		int cur_h = pmic_reg_read(pmic_dev, 0xBC);
+		int cur_l = pmic_reg_read(pmic_dev, 0xBD);
+		int vol_h = pmic_reg_read(pmic_dev, 0xC4);
+		int vol_l = pmic_reg_read(pmic_dev, 0xC5);
+
+		// 确保关键寄存器全部读取成功
+		if (vcalib0_l >= 0 && vcalib0_h >= 0 && vcalib1_l >= 0 && vcalib1_h >= 0 &&
+		    fcc3 >= 0 && fcc2 >= 0 && fcc1 >= 0 && fcc0 >= 0 &&
+		    g3 >= 0 && g2 >= 0 && g1 >= 0 && g0 >= 0 &&
+		    cur_h >= 0 && cur_l >= 0 && vol_h >= 0 && vol_l >= 0) {
+
+		    /* ==== 基础数据解析：物理电压与实时电流 ==== */
+		    int vcalib0 = (vcalib0_h << 8) | vcalib0_l;
+		    int vcalib1 = (vcalib1_h << 8) | vcalib1_l;
+		    int bat_mv = 0;
+
+		    if (vcalib1 != vcalib0) {
+			int voltage_k = (4200 - 3000) * 1000 / (vcalib1 - vcalib0);
+			int voltage_b = 4200 - (voltage_k * vcalib1) / 1000;
+			int vol_adc = (vol_h << 8) | vol_l;
+			bat_mv = (voltage_k * vol_adc) / 1000 + voltage_b;
+		    }
+
+		    int cur_adc = (cur_h << 8) | cur_l;
+		    if (cur_adc & 0x800) {
+			cur_adc -= 4096; // 负数表示放电
+		    }
+		    int bat_ma = (cur_adc * 1506) / 1000;
+
+		    /* ==============================================================
+		     * 🔧 核心修改：在此处加入内阻补偿算法 (IR Compensation)
+		     * 根据之前的实测，在 -510mA 的大电流下，负载拉低了电压。
+		     * 引入 150 毫欧（0.15 欧姆）的综合内阻阻抗，还原电池真实的物理开路电压。
+		     * ============================================================== */
+		    int ocv_mv = bat_mv;
+		    if (bat_ma < 0) {
+			// 放电状态下：还原被内阻白白拉低的电压 ( measurement_voltage + I * R )
+			ocv_mv = bat_mv + (abs(bat_ma) * 280) / 1000; 
+		    } else if (bat_ma > 0) {
+			// 充电状态下：扣除被充电抬高的虚高电压 ( measurement_voltage - I * R )
+			ocv_mv = bat_mv - (bat_ma * 280) / 1000;
+		    }
+
+		    /* ==== 算法 A: 改用补偿后的开路电压（ocv_mv）映射百分比 ==== */
+		    int pct_vol = -1;
+		    int v_max = 4150; // 满电一般 4.15V-4.2V
+		    int v_min = 3500; // 关机阈值 3.5V
+		    if (ocv_mv >= v_max) pct_vol = 100;
+		    else if (ocv_mv <= v_min) pct_vol = 0;
+		    else pct_vol = (ocv_mv - v_min) * 100 / (v_max - v_min);
+
+		    /* ==== 算法 B: 硬件库仑计电量百分比 ==== */
+		    unsigned int raw_fcc = (fcc3 << 24) | (fcc2 << 16) | (fcc1 << 8) | fcc0;
+		    if (raw_fcc > 1) {
+			fcc = raw_fcc - 1; // Linux 官方校准
+		    }
+		    if (fcc < 500 || fcc > 6000) {
+			fcc = 2500; // 降级容错基准
+		    }
+
+		    int raw_gas = (g3 << 24) | (g2 << 16) | (g1 << 8) | g0;
+		    int remain_mah = raw_gas / 2390; // 转换为毫安时
+		    int pct_clm = -1;
+
+		    if (remain_mah <= 0) pct_clm = 0;
+		    else if (remain_mah >= fcc) pct_clm = 100;
+		    else pct_clm = (remain_mah * 100) / fcc;
+
+		    /* 6. 精准打印到打字机底部状态栏 */
+		    // 格式: [ V:电压百分比% (补偿后开路电压mV) | C:库仑计百分比% (剩余/满电mAh) | 实时电流mA ]
+		    tw_status(s, "[ V:%d%% (%dmV) | C:%d%% (%dmAh/%dmAh) | I:%dmA ]", 
+			      pct_vol, ocv_mv, pct_clm, remain_mah, fcc, bat_ma);
+		    
+		    has_data = 1;
+		    break;
 		}
-		break;
+	    }
+
+	    /* 容错降级 */
+	    if (!has_data) {
+		tw_status(s, "[ BAT: Fetch failed ]");
+	    }
+	    break;
 	}
+
 	case KEY_CTRL_R:            /* open a file: arrow-select picker */
 		tw_picker_open(s);
 		break;
