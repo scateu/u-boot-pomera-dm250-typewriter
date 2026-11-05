@@ -573,6 +573,7 @@ void tw_idle_stats(unsigned long *count, unsigned long *instant,
  * (this was why M-w / M-0..9 "didn't work"). Returns -1 if nothing arrives
  * (i.e. it really was a bare ESC).
  */
+
 static int tw_getch_timeout(void)
 {
 	int spins = 30;         /* ~30 ms at 1 ms/spin */
@@ -583,6 +584,7 @@ static int tw_getch_timeout(void)
 		return -1;
 	return getchar();
 }
+
 
 static int tw_poweroff_event_pending(void);   /* defined below (EC section) */
 
@@ -602,14 +604,9 @@ static int tw_read_key(void)
 	int c;
 	static unsigned long last_press_time = 0;
 
-	/* === 1. 鍵盤事件與硬件關機高頻同步等待循環 === */
-	/* 
-	 * 我們讓主執行緒在這裏溫和地一邊等待常規按鍵，一邊以 10 毫秒的超高靈敏度監控電源鍵。
-	 * 這樣既不會擠爆 I2C 總線，又絕對不會向外彈出 0 鍵碼干擾五筆輸入法！
-	 */
+	/* === 1. 零延迟纯净事件监控循环 === */
 	while (!tstc()) {
-		/* 🔧 每 10 毫秒就進來強行檢查一次物理引腳 */
-		/* 只要抓到低電平（0），立刻在內部分發關機，絕不拖泥帶水 */
+		/* 物理引脚监控：一碰立刻关机，零延迟响应 */
 		if (gpio_get_value(2) == 0 || gpio_get_value(20) == 0) {
 			unsigned long now_time = get_timer(0);
 			if (now_time - last_press_time > 500) { 
@@ -618,30 +615,29 @@ static int tw_read_key(void)
 			}
 		}
 
-		/* 強行讓 CPU 休息 10 毫秒，釋放 I2C 鍵盤晶片壓力並防止機身發熱 */
-		udelay(10000); 
-		schedule(); /* 餵飽 U-Boot 系統看門狗 */
+		/* 保持最高频的 schedule() 盲敲总线，喂饱系统看门狗 */
+		schedule(); 
 	}
 
-	/* === 2. 只有當真正的鍵盤有字元時，才退出來讀取並解析 === */
+	/* === 2. 真正有字元流入时：激活 Stay-Awake 唤醒窗口并正常解包 === */
 	tw_stay_awake();
 	c = getchar();
 
 	if (c != KEY_ESC)
 		return c;
 
-	/* 接下來的原版 CSI / 箭頭鍵 / Meta 鍵轉義序列解析完全保持原樣不動 */
 	c = tw_getch_timeout();
 	if (c < 0)
 		return KEY_ESC;
 
 	if (c == '[' || c == 'O') {
 		c = tw_getch_timeout();
+		int mapped_key = KEY_ESC;
 		switch (c) {
-		case 'A': return KEY_ARROW_UP;
-		case 'B': return KEY_ARROW_DOWN;
-		case 'C': return KEY_ARROW_RIGHT;
-		case 'D': return KEY_ARROW_LEFT;
+		case 'A': mapped_key = KEY_ARROW_UP; break;
+		case 'B': mapped_key = KEY_ARROW_DOWN; break;
+		case 'C': mapped_key = KEY_ARROW_RIGHT; break;
+		case 'D': mapped_key = KEY_ARROW_LEFT; break;
 		case 'H': return KEY_HOME_SEQ;
 		case 'F': return KEY_END_SEQ;
 		case '1': case '2': case '3':
@@ -661,6 +657,7 @@ static int tw_read_key(void)
 		default:
 			return KEY_ESC;
 		}
+		return mapped_key;
 	}
 
 	switch (c) {
@@ -671,7 +668,6 @@ static int tw_read_key(void)
 	default:            return KEY_ESC;
 	}
 }
-
 
 static void tw_status(struct tw_state *s, const char *fmt, ...)
 {
@@ -1516,6 +1512,10 @@ static void tw_boot(struct tw_state *s)
  */
 static void tw_poweroff(struct tw_state *s)
 {
+	tw_status(s, "[ Powering off... ]");
+	s->dirty_bar = 1; 
+	s->dirty_all = 1;
+	tw_render(s);
 	/* 1. flush the document to disk if there's anything to save. */
 	if (tw_save_before_exit(s) != 0)
 		return;
@@ -2022,6 +2022,14 @@ static void tw_handle_key(struct tw_state *s, int key)
 	}
 
 	switch (key) {
+	case KEY_CTRL_L:
+		s->first_paint = 1;   /* 物理信号：强制下一帧重走底册全清除重绘 */
+		s->dirty_all = 1;
+		s->dirty_title = 1;
+		s->dirty_bar = 1;
+		s->dirty_hints = 1;
+		tw_status(s, "[ Screen refreshed ]");
+		break;
 	case KEY_CTRL_S:            /* save (one-handed) */
 		tw_prompt_start(s, TW_PROMPT_SAVE);
 		break;
