@@ -39,9 +39,10 @@
  * which dominates idle power; default lower and step it with ^- / ^=. */
 #define TW_BACKLIGHT_DEFAULT 10      /* percent set on startup */
 #define TW_BACKLIGHT_STEP    5       /* percent per ^- / ^= press */
-#define TW_BACKLIGHT_MIN     5       /* never dim below this - 0/OFF freezes it
+#define TW_BACKLIGHT_MIN     25       /* never dim below this - 0/OFF freezes it
 				      * (a low NONZERO % is safe; only literal
 				      * 0/BACKLIGHT_OFF froze the panel/PWM). */
+#define TW_BACKLIGHT_MAX     95   
 
 /* File I/O scratch is malloc()'d at runtime (see cmd_tw_fs.c) - NOT staged at
  * a fixed CONFIG_SYS_LOAD_ADDR, which on this board overlaps U-Boot's own DRAM

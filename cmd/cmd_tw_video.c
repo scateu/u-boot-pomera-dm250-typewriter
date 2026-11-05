@@ -450,8 +450,8 @@ static void tw_backlight_apply(int pct)
 {
 	if (pct < TW_BACKLIGHT_MIN)
 		pct = TW_BACKLIGHT_MIN;
-	if (pct > 100)
-		pct = 100;
+	if (pct > TW_BACKLIGHT_MAX)
+		pct = TW_BACKLIGHT_MAX;
 	if (g_backlight)
 		backlight_set_brightness(g_backlight, pct);
 	else if (g_panel)
@@ -462,8 +462,8 @@ int tw_backlight_set(int pct)
 {
 	if (pct < TW_BACKLIGHT_MIN)
 		pct = TW_BACKLIGHT_MIN;
-	if (pct > 100)
-		pct = 100;
+	if (pct > TW_BACKLIGHT_MAX)
+		pct = TW_BACKLIGHT_MAX;
 	g_brightness = pct;
 	tw_backlight_apply(pct);
 	return g_brightness;
